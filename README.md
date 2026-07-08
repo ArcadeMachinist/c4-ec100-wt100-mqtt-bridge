@@ -1,0 +1,347 @@
+# Control4 EC-100 Thermostat → Home Assistant MQTT Bridge
+
+Bridges the Control4 EC-100 director's local TCP API to Home Assistant via MQTT.
+Exposes a WT100 Z-Wave thermostat (device 84) as a native HA `climate` entity with full
+two-way control: HVAC mode, fan mode, hold (preset), heat/cool setpoints, current
+temperature, and battery level.
+
+## Build
+
+Requires [Zig](https://ziglang.org/) 0.12+ for cross-compilation to the EC-100's ARMv5TEJL CPU.
+
+```sh
+zig cc -target arm-linux-musleabi -mcpu=arm926ej_s -O2 -static \
+       c4_mqtt_bridge.c arm5_atomics.S -o c4_mqtt_bridge
+```
+
+`arm5_atomics.S` provides `__sync_*` atomic shims required because ARMv5TEJ has no
+hardware atomic instructions and musl's CAS intrinsics don't compile for it cleanly.
+
+## Deploy
+
+```sh
+# Copy to EC-100 (old SSH server — needs legacy options)
+scp -O \
+    -o KexAlgorithms=+diffie-hellman-group1-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    c4_mqtt_bridge root@<EC100_IP>:/tmp/c4_mqtt_bridge
+
+# Run (survives SSH logout)
+ssh root@<EC100_IP> \
+    "chmod +x /tmp/c4_mqtt_bridge; /tmp/c4_mqtt_bridge > /tmp/bridge.log 2>&1 &"
+
+# Watch logs
+ssh root@<EC100_IP> "tail -f /tmp/bridge.log"
+```
+
+Optional: override MQTT host/port at runtime:
+```sh
+/tmp/c4_mqtt_bridge <MQTT_BROKER_IP> 1883
+```
+
+## MQTT Topics
+
+| Topic | Direction | Description |
+|---|---|---|
+| `c4/thermostat/state` | Bridge → HA | JSON state (retained) |
+| `c4/thermostat/avail` | Bridge → HA | `online` / `offline` (retained) |
+| `homeassistant/climate/c4_thermostat/config` | Bridge → HA | HA MQTT Discovery payload (retained) |
+| `homeassistant/sensor/c4_thermostat_battery/config` | Bridge → HA | Battery sensor discovery (retained) |
+| `c4/thermostat/mode/set` | HA → Bridge | `off` / `heat` / `cool` |
+| `c4/thermostat/fan/set` | HA → Bridge | `auto` / `on` |
+| `c4/thermostat/temp_hi/set` | HA → Bridge | Cool setpoint in °F |
+| `c4/thermostat/temp_lo/set` | HA → Bridge | Heat setpoint in °F |
+| `c4/thermostat/preset/set` | HA → Bridge | `hold` / `none` |
+
+State JSON example:
+```json
+{
+  "temperature": 72.0,
+  "heat_setpoint": 70.0,
+  "cool_setpoint": 78.0,
+  "hvac_mode": "heat",
+  "fan_mode": "auto",
+  "preset": "none",
+  "battery": 79
+}
+```
+
+---
+
+# Control4 EC-100 Internal Protocol Notes
+
+Everything below was reverse-engineered from the EC-100 firmware, live traffic captures,
+and decompilation of the Control4 Navigator SWF SDK (`navigator_sdk.swf`).
+
+## Director TCP API (c4soap)
+
+The director (`/sbin/director`) listens on two ports:
+
+| Port | Interface | Purpose |
+|---|---|---|
+| 5020 | 127.0.0.1 (loopback only) | Flash navigator (local) — **use this one** |
+| 5021 | 0.0.0.0 (all interfaces) | Composer Pro (PC software), appears to speak a different protocol |
+
+**Wire format:** null-byte (`\x00`) terminated XML strings over a persistent TCP connection.
+Each message is one XML element followed by `\x00`. Responses come back the same way.
+There is no framing header, no length prefix, no TLS.
+
+**Authentication:** Send `AuthenticatePassword` first on the same connection. On this
+system the director password is empty (no password set in `DirectorState.xml`):
+
+```xml
+<c4soap name="AuthenticatePassword" async="False" seq="1">
+  <param name="password" type="string"></param>
+</c4soap>
+```
+
+Response: `<c4soap name="AuthenticatePassword" seq="1" result="1"><success/></c4soap>`
+
+Read-only commands (GetVariables, GetItems, GetBindings) work unauthenticated.
+Write commands (SendToDeviceAsync, ExecuteCommand) require auth on the same connection.
+
+**Event subscription:**
+```xml
+<c4soap name="EnableEvents" async="False" seq="2">
+  <param name="enable" type="bool">1</param>
+</c4soap>
+```
+
+After enabling events, the director pushes `OnVariableChanged` messages whenever any
+variable changes, without polling.
+
+## Device Hierarchy (thermostat)
+
+| Device ID | Type | Description |
+|---|---|---|
+| 83 | WT-100 Zigbee driver | Hardware device — directly handles Z-Wave |
+| 84 | thermostatV2 proxy | Child proxy — **the correct target for all commands** |
+| 76 | thermostatV2 proxy | IS_CONNECTED=False, inactive — ignore |
+
+All thermostat commands go to **device 84** via `SendToDeviceAsync`.
+Battery level comes from **device 83** (the hardware driver).
+
+## Reading Variables
+
+`GetVariables` (no filter) returns all variables for all devices as a single large XML
+response (~88 KB). `GetVariablesByDevice` is broken and returns empty for most devices.
+Parse the `GetVariables` dump locally, filtering by `deviceid`.
+
+```xml
+<c4soap name="GetVariables" async="False" seq="3"></c4soap>
+```
+
+Variables are returned as:
+```xml
+<variable deviceid="84" variableid="1104" name="HVAC_MODE"
+          type="1" readonly="1" hidden="0" bindingid="0" bindingname="">Heat</variable>
+```
+
+## Device 84 Variable Reference
+
+### Display variables (°F integer — most useful)
+
+| varid | name | example | notes |
+|---|---|---|---|
+| 1117 | DISPLAY_TEMPERATURE | 72 | Current temperature in °F |
+| 1118 | DISPLAY_HEATSETPOINT | 70 | Heat setpoint in °F |
+| 1119 | DISPLAY_COOLSETPOINT | 78 | Cool setpoint in °F |
+
+### V2 mode/state variables
+
+| varid | name | example | notes |
+|---|---|---|---|
+| 1100 | SCALE | F | Temperature scale in use |
+| 1101 | TEMPERATURE | 222 | Current temp in Celsius×10 |
+| 1102 | HEAT_SETPOINT | 211 | Heat setpoint in Celsius×10 |
+| 1103 | COOL_SETPOINT | 255 | Cool setpoint in Celsius×10 |
+| 1104 | HVAC_MODE | Heat | "Off", "Heat", "Cool", "Emergency Heat" |
+| 1105 | FAN_MODE | Auto | "Auto", "On" |
+| 1106 | HOLD_MODE | Off | "Off", "2 Hours" |
+| 1107 | HVAC_STATE | Off | Whether the unit is actively heating/cooling |
+| 1108 | FAN_STATE | Off | Whether the fan is running |
+| 1112 | IS_CONNECTED | True | Zigbee connectivity |
+| 1120 | HVAC_MODES_LIST | Off,Heat,Cool,Emergency Heat | Comma-separated available modes |
+| 1121 | FAN_MODES_LIST | Auto,On | |
+| 1122 | HOLD_MODES_LIST | Off,2 Hours | Only two options |
+
+### V2 temperature unit encoding
+
+Celsius×10: `211` = 21.1 °C = 70 °F.  
+Conversion: `°F = C10 / 10 * 9 / 5 + 32`
+
+### V1 variables (legacy, °F, some writable)
+
+varid 1000–1018 mirror the V2 state in °F integer. varids 1004 (HEAT_SETPOINT) and
+1005 (COOL_SETPOINT) have `readonly=0` but writing them via `SetVariable` only updates
+the director cache — it does not push the value to the thermostat hardware.
+
+### Device 83 variables
+
+| varid | name | example | notes |
+|---|---|---|---|
+| 1001 | BatteryLevel | 79 | % integer; fluctuates slightly with ambient temperature |
+
+## Sending Commands (confirmed working)
+
+**Use `SendToDeviceAsync`** — NOT `ExecuteCommand`. `ExecuteCommand` with `iditem`
+returns `result=1` but has no effect on the thermostat.
+
+### Command XML envelope
+
+```xml
+<c4soap name="SendToDeviceAsync" async="True" seq="10">
+  <param type="number" name="iddevice">84</param>
+  <param type="string" name="data">
+    <devicecommand>
+      <command>COMMAND_NAME</command>
+      <params>
+        <param>
+          <name>PARAM_NAME</name>
+          <value type="string"><static>VALUE</static></value>
+        </param>
+      </params>
+    </devicecommand>
+  </param>
+</c4soap>
+```
+
+### Mode commands — param name `MODE`
+
+| Command | Param | Values |
+|---|---|---|
+| `SET_MODE_HVAC` | `MODE` | `Heat`, `Cool`, `Off`, `Emergency Heat` |
+| `SET_MODE_FAN` | `MODE` | `Auto`, `On` |
+| `SET_MODE_HOLD` | `MODE` | `Off`, `2 Hours` |
+
+Values are **titlecase** (e.g. `Heat` not `heat`, `2 Hours` not `2 hours`).
+
+The param name `MODE` is always `MODE` for these three commands regardless of what
+the command does. This was confirmed by decompiling `navigator_sdk.swf` at offset
+198822 where the pattern `m_tstatModeRefCount|MODE|SET_MODE_HVAC` appears, showing the
+ActionScript `C4SoapStringParam("MODE", value)` call shared across all three.
+
+### Setpoint commands — param name `KELVIN`, value in Kelvin×10
+
+| Command | Param | Value |
+|---|---|---|
+| `SET_SETPOINT_HEAT` | `KELVIN` | Kelvin×10 integer |
+| `SET_SETPOINT_COOL` | `KELVIN` | Kelvin×10 integer |
+
+**Why Kelvin×10:** The Navigator SDK's `ThermostatV2Driver` ActionScript class uses
+`KELVIN` as the param name for both vacation setpoints (`SET_VAC_SETPOINT_COOL/HEAT`)
+and regular setpoints (`SET_SETPOINT_COOL/HEAT`). The `SendSetPoint` helper has no
+separate string constant in the binary, meaning it reuses the `KELVIN` constant already
+in the pool (confirmed: it appears before `SET_SETPOINT_HEAT/COOL` in the binary and
+after `SET_VAC_SETPOINT_COOL/HEAT` which explicitly use it).
+
+The director converts Kelvin×10 to Celsius×10 for storage (subtracts 2732).
+
+Conversion formula (°F → Kelvin×10):
+```c
+int k10 = (int)((f - 32.0f) * 50.0f / 9.0f + 2731.5f + 0.5f);
+```
+
+Verification: 70 °F → k10=2943, 2943−2732=211 ✓ (matches stored HEAT_SETPOINT)  
+Verification: 78 °F → k10=2987, 2987−2732=255 ✓ (matches stored COOL_SETPOINT)
+
+**Commands that do NOT work:**
+- `SET_SETPOINT_COOL` with param `hvac_mode`, `holdmode`, `hold_mode`, `SETPOINT` — silently ignored
+- `SET_SETPOINT_COOL` with param `MODE` and °F value — silently ignored (wrong unit)
+- `ExecuteCommand` with `iditem` for any thermostat command — returns result=1 but no effect
+
+## Thermostat Polling Behavior (Zigbee timing)
+
+The WT100 is a sleepy Zigbee end device. Two distinct polling patterns:
+
+- **Idle / night:** polls every ~18 minutes (matches `IndoorTemp` log entries in
+  `/mnt/ram/var/log/tmp_selogs/`)
+- **Active (unit running):** polls every 4–5 minutes
+
+Commands sent to the director are queued for the next Zigbee poll. If the thermostat is
+in 18-minute sleep, the command sits in the queue and may expire before the thermostat
+wakes. During active cooling/heating (daytime), commands reliably take effect within
+5–7 seconds because the poll interval is short.
+
+The bridge does not implement wakeup-waiting — commands are sent immediately upon receipt
+from MQTT. This works well during active use; during deep sleep the command may be
+delayed up to 18 minutes.
+
+## Hold Mode Behavior
+
+`SET_MODE_HOLD MODE=2 Hours` enables a 2-hour manual override on the current setpoints
+and mode, preventing the schedule from reverting them. After 2 hours the thermostat
+returns to its programmed schedule.
+
+The bridge exposes hold as an HA `preset_mode`: `none` (hold off, follow schedule) or
+`hold` (2-hour override). The 2-hour timer resets each time `SET_MODE_HOLD MODE=2 Hours`
+is sent. The bridge re-sends it automatically every 90 minutes while hold is active to
+prevent expiry.
+
+Setpoint or mode changes from HA do **not** automatically set hold — the user must
+explicitly set `preset=hold` from HA to lock the new settings against the schedule.
+
+## Navigator SDK SWF
+
+`navigator_sdk.swf` is the Control4 Flash navigator binary. It can be decompressed with
+`zlib` (skip the 8-byte SWF header, decompress the rest) to get searchable ActionScript
+bytecode. Key findings used to reverse the command format:
+
+- Offset 91213: `SendToDeviceAsync` XML template with `iddevice` and `devicecommand`
+- Offset 198822: `m_tstatModeRefCount|MODE|SET_MODE_HVAC` — confirms MODE param for mode commands
+- Offset 198947: `m_fanModeRefCount|SET_MODE_FAN` — same MODE string reused
+- Offset ~200000: `SetVacationCoolSetPoint|KELVIN|SET_VAC_SETPOINT_COOL` — confirms KELVIN param
+- Offset 202122: `hvac_mode|fan_mode|hold_mode` etc. appear in `ParseParams|InjectParamNode|nodeName`
+  context — these are **incoming** variable names the Flash UI reads from director
+  notifications, NOT command param names
+
+Variable names like `hvac_mode`, `holdmode`, `hold_mode`, `hvac_mode` appear in the
+`ParseParams` section — they are what the director sends TO the Flash UI when variables
+change. They are not valid command param names for outgoing commands.
+
+## EC-100 SSH Access
+
+The EC-100 runs an old OpenSSH server that requires legacy negotiation:
+
+```sh
+ssh -o KexAlgorithms=+diffie-hellman-group1-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    root@<EC100_IP>
+```
+
+For `scp`, add `-O` to force the legacy SCP protocol (the default SFTP subsystem is
+not available on this server):
+
+```sh
+scp -O \
+    -o KexAlgorithms=+diffie-hellman-group1-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    file root@<EC100_IP>:/tmp/
+```
+
+`pkill` is not available (BusyBox). To kill a process by name:
+```sh
+kill $(ps | grep c4_mqtt_bridge | grep -v grep | awk '{print $1}')
+```
+
+`nohup` is also not available. Background a process with:
+```sh
+/tmp/c4_mqtt_bridge > /tmp/bridge.log 2>&1 &
+```
+
+## Thermostat Activity Log
+
+The director writes a timestamped CSV log for each thermostat device to:
+```
+/mnt/ram/var/log/tmp_selogs/YYYY-MM-DD_Thermostat_84_activity.log
+```
+
+Format: `YYYY-MM-DDThh:mm:ss,EventType,Value`
+
+Useful for correlating command delivery with thermostat wakeup events:
+```
+2026-07-08T20:31:02,IndoorTemp,22.6
+```
+
+Each `IndoorTemp` entry marks a thermostat wakeup (Zigbee poll). If the gap between
+entries is ~18 minutes, the thermostat is in deep sleep.
