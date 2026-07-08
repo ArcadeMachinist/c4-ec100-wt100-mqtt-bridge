@@ -1,9 +1,15 @@
-# Control4 EC-100 Thermostat → Home Assistant MQTT Bridge
+# Control4 EC-100/WT-100 SmartEnergy Thermostat → Home Assistant MQTT Bridge
 
 Bridges the Control4 EC-100 director's local TCP API to Home Assistant via MQTT.
 Exposes a WT100 Z-Wave thermostat (device 84) as a native HA `climate` entity with full
 two-way control: HVAC mode, fan mode, hold (preset), heat/cool setpoints, current
 temperature, and battery level.
+
+EC-100 is based on Ti DM365 DaVinci Digital Media Processor, has 1Gb NAND storage, 256Mb RAM and runs Linux 2.6.32-rc2.44
+
+This is EXPERIMENTAL solution.
+It is not "production" ready, there are still things to figure out/clarify.
+I do not include EC-100 root password here, it is unique for each individual device, but can be guessed, based on MAC and Zigbee SEC "Install Code"
 
 ## Build
 
