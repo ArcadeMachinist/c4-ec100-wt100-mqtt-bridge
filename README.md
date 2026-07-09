@@ -202,7 +202,7 @@ variable changes, without polling.
 
 | Device ID | Type | Description |
 |---|---|---|
-| 83 | WT-100 Zigbee driver | Hardware device — directly handles Z-Wave |
+| 83 | WT-100 Zigbee driver | Hardware device — directly handles Zigbee |
 | 84 | thermostatV2 proxy | Child proxy — **the correct target for all commands** |
 | 76 | thermostatV2 proxy | IS_CONNECTED=False, inactive — ignore |
 
