@@ -5,6 +5,10 @@ Exposes a WT100 Z-Wave thermostat (device 84) as a native HA `climate` entity wi
 two-way control: HVAC mode, fan mode, hold (preset), heat/cool setpoints, current
 temperature, and battery level.
 
+Control4 EC-100 is an "energy controller" with a companion WT-100 thermostat.
+
+Originally it was supposed to connect to your electric company via HTTP, and to your smart meter via Zigbee SEC. At the same time it uses propietary Zigbee HA profile to talk with the companion thermostat.
+
 EC-100 is based on Ti DM365 DaVinci Digital Media Processor, has 1Gb NAND storage, 256Mb RAM and runs Linux 2.6.32-rc2.44
 
 This is EXPERIMENTAL solution.
