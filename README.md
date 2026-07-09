@@ -21,6 +21,8 @@ I do not include EC-100 root password here, it is unique for each individual dev
 
 Requires [Zig](https://ziglang.org/) 0.12+ for cross-compilation to the EC-100's ARMv5TEJL CPU.
 
+Set your MQTT_BROKER_IP in the code.
+
 ```sh
 zig cc -target arm-linux-musleabi -mcpu=arm926ej_s -O2 -static \
        c4_mqtt_bridge.c arm5_atomics.S -o c4_mqtt_bridge
