@@ -158,8 +158,8 @@ State JSON example:
 
 # Control4 EC-100 Internal Protocol Notes
 
-Everything below was reverse-engineered from the EC-100 firmware, live traffic captures,
-and decompilation of the Control4 Navigator SWF SDK (`navigator_sdk.swf`).
+Everything below was reverse-engineered from live traffic captures,
+and EC-100 on device log files.
 
 ## Director TCP API (c4soap)
 
