@@ -23,7 +23,7 @@ zig cc -target arm-linux-musleabi -mcpu=arm926ej_s -O2 -static \
 `arm5_atomics.S` provides `__sync_*` atomic shims required because ARMv5TEJ has no
 hardware atomic instructions and musl's CAS intrinsics don't compile for it cleanly.
 
-## Deploy
+## Deploy (temporary — lost on reboot)
 
 ```sh
 # Copy to EC-100 (old SSH server — needs legacy options)
@@ -32,7 +32,7 @@ scp -O \
     -o HostKeyAlgorithms=+ssh-rsa \
     c4_mqtt_bridge root@<EC100_IP>:/tmp/c4_mqtt_bridge
 
-# Run (survives SSH logout)
+# Run (survives SSH logout, but not reboot)
 ssh root@<EC100_IP> \
     "chmod +x /tmp/c4_mqtt_bridge; /tmp/c4_mqtt_bridge > /tmp/bridge.log 2>&1 &"
 
@@ -44,6 +44,82 @@ Optional: override MQTT host/port at runtime:
 ```sh
 /tmp/c4_mqtt_bridge <MQTT_BROKER_IP> 1883
 ```
+
+## Persistent Install (survives reboots)
+
+The EC-100 runs BusyBox SysV init. Startup scripts in `/etc/rc.d/` are executed
+alphabetically by `rc.sysinit2`. `/etc` and `/mnt/internal` survive reboots.
+
+```sh
+SSH="ssh -o KexAlgorithms=+diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa"
+SCP="scp -O -o KexAlgorithms=+diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa"
+
+# 1. Install binary to persistent storage
+$SCP c4_mqtt_bridge root@<EC100_IP>:/mnt/internal/c4_mqtt_bridge
+
+# 2. Create init.d service script
+$SSH root@<EC100_IP> 'cat > /etc/init.d/c4bridge << '"'"'SCRIPT'"'"'
+#!/bin/sh
+BIN=/mnt/internal/c4_mqtt_bridge
+LOG=/mnt/ram/var/log/c4bridge.log
+case $1 in
+start)   chmod +x $BIN; $BIN > $LOG 2>&1 & ;;
+stop)    kill $(ps | grep c4_mqtt_bridge | grep -v grep | awk "{print \$1}") 2>/dev/null ;;
+restart) $0 stop; sleep 1; $0 start ;;
+getdisplayname) echo "C4 MQTT Bridge" ;;
+esac
+exit 0
+SCRIPT
+chmod +x /etc/init.d/c4bridge'
+
+# 3. Create rc.d entry (runs after director, slot 90)
+$SSH root@<EC100_IP> 'cat > /etc/rc.d/90c4bridge << '"'"'SCRIPT'"'"'
+#!/bin/sh
+case $1 in
+start) (sleep 20; /etc/init.d/c4bridge start) & ;;
+stop)  /etc/init.d/c4bridge stop ;;
+getdisplayname) echo "C4 MQTT Bridge" ;;
+esac
+exit 0
+SCRIPT
+chmod +x /etc/rc.d/90c4bridge'
+```
+
+The 20-second delay in the startup script lets the director and Zigbee stack fully
+initialize before the bridge connects. The bridge log after boot is at
+`/mnt/ram/var/log/c4bridge.log` (RAM-based, so cleared each reboot — check it early).
+
+To start/stop manually without rebooting:
+```sh
+$SSH root@<EC100_IP> "/etc/init.d/c4bridge start"
+$SSH root@<EC100_IP> "/etc/init.d/c4bridge stop"
+```
+
+## Remove from EC-100
+
+Stop the running bridge, remove startup hooks, remove binary, then clear the retained
+HA discovery payloads so Home Assistant stops showing the device.
+
+```sh
+SSH="ssh -o KexAlgorithms=+diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa"
+
+# Stop and remove from EC-100
+$SSH root@<EC100_IP> "
+  /etc/init.d/c4bridge stop
+  rm -f /etc/rc.d/90c4bridge
+  rm -f /etc/init.d/c4bridge
+  rm -f /mnt/internal/c4_mqtt_bridge
+"
+
+# Clear retained HA discovery payloads (requires mosquitto_pub or similar)
+mosquitto_pub -h <MQTT_BROKER_IP> -t homeassistant/climate/c4_thermostat/config -n -r
+mosquitto_pub -h <MQTT_BROKER_IP> -t homeassistant/sensor/c4_thermostat_battery/config -n -r
+mosquitto_pub -h <MQTT_BROKER_IP> -t c4/thermostat/state -n -r
+mosquitto_pub -h <MQTT_BROKER_IP> -t c4/thermostat/avail -n -r
+```
+
+The `-n -r` flags publish a zero-length retained message, which clears the retained
+value and causes Home Assistant to remove the auto-discovered device.
 
 ## MQTT Topics
 
