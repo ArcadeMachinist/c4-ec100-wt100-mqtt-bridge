@@ -305,9 +305,7 @@ returns `result=1` but has no effect on the thermostat.
 Values are **titlecase** (e.g. `Heat` not `heat`, `2 Hours` not `2 hours`).
 
 The param name `MODE` is always `MODE` for these three commands regardless of what
-the command does. This was confirmed by decompiling `navigator_sdk.swf` at offset
-198822 where the pattern `m_tstatModeRefCount|MODE|SET_MODE_HVAC` appears, showing the
-ActionScript `C4SoapStringParam("MODE", value)` call shared across all three.
+the command does. 
 
 ### Setpoint commands — param name `KELVIN`, value in Kelvin×10
 
@@ -368,24 +366,6 @@ prevent expiry.
 
 Setpoint or mode changes from HA do **not** automatically set hold — the user must
 explicitly set `preset=hold` from HA to lock the new settings against the schedule.
-
-## Navigator SDK SWF
-
-`navigator_sdk.swf` is the Control4 Flash navigator binary. It can be decompressed with
-`zlib` (skip the 8-byte SWF header, decompress the rest) to get searchable ActionScript
-bytecode. Key findings used to reverse the command format:
-
-- Offset 91213: `SendToDeviceAsync` XML template with `iddevice` and `devicecommand`
-- Offset 198822: `m_tstatModeRefCount|MODE|SET_MODE_HVAC` — confirms MODE param for mode commands
-- Offset 198947: `m_fanModeRefCount|SET_MODE_FAN` — same MODE string reused
-- Offset ~200000: `SetVacationCoolSetPoint|KELVIN|SET_VAC_SETPOINT_COOL` — confirms KELVIN param
-- Offset 202122: `hvac_mode|fan_mode|hold_mode` etc. appear in `ParseParams|InjectParamNode|nodeName`
-  context — these are **incoming** variable names the Flash UI reads from director
-  notifications, NOT command param names
-
-Variable names like `hvac_mode`, `holdmode`, `hold_mode`, `hvac_mode` appear in the
-`ParseParams` section — they are what the director sends TO the Flash UI when variables
-change. They are not valid command param names for outgoing commands.
 
 ## EC-100 SSH Access
 
